@@ -59,8 +59,8 @@
     <section class="card muted">
       <h2>Available endpoints</h2>
       <ul>
-        <li><code>GET /health</code> — health check</li>
-        <li><code>GET /api/history</code> — latest cached analyses</li>
+        <li><code>GET /health</code> - health check</li>
+        <li><code>GET /api/history</code> - latest cached analyses</li>
       </ul>
     </section>
   </main>

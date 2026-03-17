@@ -4,4 +4,6 @@ app = Flask(__name__)
 
 @app.get("/")
 def root():
-    return render_template("index.html")
+    return ("index.html")
+
+

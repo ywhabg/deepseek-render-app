@@ -1,0 +1,810 @@
+import os
+import re
+import json
+import time
+import hmac
+import sqlite3
+import hashlib
+from datetime import datetime
+from collections import deque
+from typing import List, Dict, Any, Optional, Set
+from urllib.parse import urljoin, urlparse, urlunparse, parse_qsl, urlencode
+
+import requests
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from flask import Flask, render_template, request, jsonify
+from openai import OpenAI
+
+load_dotenv()
+
+app = Flask(__name__)
+app.config["JSON_SORT_KEYS"] = False
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    )
+}
+
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
+CRAWL_DELAY_SECONDS = float(os.getenv("CRAWL_DELAY_SECONDS", "0.8"))
+MAX_PAGES_DEFAULT = int(os.getenv("MAX_PAGES_DEFAULT", "20"))
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+RETRY_BASE_DELAY = float(os.getenv("RETRY_BASE_DELAY", "2.0"))
+CHUNK_SIZE_CHARS = int(os.getenv("CHUNK_SIZE_CHARS", "6000"))
+CHUNK_OVERLAP_CHARS = int(os.getenv("CHUNK_OVERLAP_CHARS", "500"))
+MAX_CHUNKS_PER_PAGE = int(os.getenv("MAX_CHUNKS_PER_PAGE", "8"))
+FINAL_SUMMARY_WORD_LIMIT = 150
+DEFAULT_DESTINATION_URL = os.getenv("DEFAULT_DESTINATION_URL", "")
+DEFAULT_OUTBOUND_BEARER_TOKEN = os.getenv("DEFAULT_OUTBOUND_BEARER_TOKEN", "")
+
+DATA_DIR = os.getenv("DATA_DIR", "./data")
+DB_PATH = os.path.join(DATA_DIR, "analysis_cache.db")
+
+TRACKING_PARAMS = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "gclid", "fbclid", "mc_cid", "mc_eid"
+}
+
+SKIP_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico",
+    ".pdf", ".zip", ".rar", ".7z", ".tar", ".gz",
+    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".mp4", ".mp3", ".avi", ".mov", ".wmv",
+    ".css", ".js", ".json", ".xml"
+}
+
+SKIP_KEYWORDS = {
+    "login", "logout", "signin", "signup", "register",
+    "cart", "checkout", "account", "profile",
+    "search?", "/search", "wp-admin", "admin"
+}
+
+LOW_VALUE_PATTERNS = [
+    "privacy policy",
+    "cookie policy",
+    "terms of use",
+    "terms and conditions",
+    "page not found",
+    "404",
+    "access denied",
+    "sign in",
+    "log in",
+]
+
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
+
+
+def ensure_data_dir() -> None:
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+
+def get_db_connection() -> sqlite3.Connection:
+    ensure_data_dir()
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    conn = get_db_connection()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS analyzed_pages (
+            content_hash TEXT PRIMARY KEY,
+            url TEXT,
+            title TEXT,
+            content_summary TEXT,
+            result_json TEXT NOT NULL,
+            analyzed_at TEXT NOT NULL,
+            destination_url TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS delivery_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            content_hash TEXT,
+            destination_url TEXT,
+            status_code INTEGER,
+            success INTEGER NOT NULL,
+            response_excerpt TEXT,
+            sent_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+@app.before_request
+def startup() -> None:
+    init_db()
+
+
+def get_deepseek_client() -> OpenAI:
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+    if not api_key:
+        raise ValueError("DEEPSEEK_API_KEY not found in environment variables.")
+    return OpenAI(api_key=api_key, base_url=DEEPSEEK_BASE_URL)
+
+
+def clean_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def normalize_url(url: str) -> str:
+    parsed = urlparse(url)
+    clean_query_pairs = []
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        if key.lower() not in TRACKING_PARAMS:
+            clean_query_pairs.append((key, value))
+    clean_query = urlencode(clean_query_pairs, doseq=True)
+    normalized_path = parsed.path.rstrip("/") if parsed.path != "/" else "/"
+    normalized = parsed._replace(path=normalized_path, query=clean_query, fragment="")
+    return urlunparse(normalized)
+
+
+def is_same_domain(base_url: str, target_url: str) -> bool:
+    return urlparse(base_url).netloc == urlparse(target_url).netloc
+
+
+def should_skip_url(url: str) -> bool:
+    lower_url = url.lower()
+    if lower_url.startswith(("mailto:", "javascript:", "tel:")):
+        return True
+    if any(lower_url.endswith(ext) for ext in SKIP_EXTENSIONS):
+        return True
+    if any(keyword in lower_url for keyword in SKIP_KEYWORDS):
+        return True
+    return False
+
+
+def is_html_response(response: requests.Response) -> bool:
+    return "text/html" in response.headers.get("Content-Type", "").lower()
+
+
+def safe_json_loads(text: str) -> Dict[str, Any]:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return {
+            "relevance": "Unknown",
+            "opportunity_score": 0,
+            "industry": "Unknown",
+            "signals": [],
+            "services": [],
+            "risk_flags": [],
+            "public_sector_hint": "Unknown",
+            "agency_hints": [],
+            "chunk_assessment": text[:500],
+            "content_summary": text[:500],
+            "public_sector_relevant": "Unknown",
+            "relevant_agencies": [],
+            "agency_pursuit_rationale": "",
+        }
+
+
+def dedupe_preserve_order(values: List[str]) -> List[str]:
+    seen = set()
+    result = []
+    for value in values:
+        v = str(value).strip()
+        if v and v not in seen:
+            seen.add(v)
+            result.append(v)
+    return result
+
+
+def get_with_retries(url: str, timeout: int = REQUEST_TIMEOUT) -> Optional[requests.Response]:
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = SESSION.get(url, timeout=timeout)
+            response.raise_for_status()
+            return response
+        except requests.RequestException:
+            if attempt == MAX_RETRIES:
+                return None
+            time.sleep(RETRY_BASE_DELAY * attempt)
+    return None
+
+
+def compute_content_hash(text: str) -> str:
+    return hashlib.sha256(clean_text(text).encode("utf-8")).hexdigest()
+
+
+def utc_now_string() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def extract_internal_links(page_url: str, soup: BeautifulSoup, base_url: str) -> List[str]:
+    links = []
+    for a_tag in soup.find_all("a", href=True):
+        full_url = normalize_url(urljoin(page_url, a_tag["href"].strip()))
+        if not full_url.startswith("http"):
+            continue
+        if not is_same_domain(base_url, full_url):
+            continue
+        if should_skip_url(full_url):
+            continue
+        links.append(full_url)
+    return dedupe_preserve_order(links)
+
+
+def crawl_site(start_url: str, max_pages: int, restrict_to_path: bool) -> List[str]:
+    start_url = normalize_url(start_url)
+    visited: Set[str] = set()
+    discovered: Set[str] = {start_url}
+    queue = deque([start_url])
+    results: List[str] = []
+
+    base_domain = urlparse(start_url).netloc
+    start_path = urlparse(start_url).path.rstrip("/")
+
+    while queue and len(results) < max_pages:
+        current_url = queue.popleft()
+        if current_url in visited:
+            continue
+        visited.add(current_url)
+
+        response = get_with_retries(current_url)
+        if not response or not is_html_response(response):
+            continue
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        results.append(current_url)
+
+        for link in extract_internal_links(current_url, soup, start_url):
+            if link in visited or link in discovered:
+                continue
+            parsed = urlparse(link)
+            if parsed.netloc != base_domain:
+                continue
+            if restrict_to_path and start_path and not parsed.path.startswith(start_path):
+                continue
+            discovered.add(link)
+            queue.append(link)
+
+        time.sleep(CRAWL_DELAY_SECONDS)
+
+    return results
+
+
+def scrape_page(url: str) -> Optional[Dict[str, Any]]:
+    response = get_with_retries(url)
+    if not response or not is_html_response(response):
+        return None
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.string.strip() if soup.title and soup.title.string else "No title"
+
+    headings = []
+    for tag_name in ["h1", "h2", "h3"]:
+        for tag in soup.find_all(tag_name):
+            text = clean_text(tag.get_text(" ", strip=True))
+            if text:
+                headings.append(f"{tag_name.upper()}: {text}")
+
+    paragraphs = []
+    for p_tag in soup.find_all("p"):
+        text = clean_text(p_tag.get_text(" ", strip=True))
+        if len(text) > 40:
+            paragraphs.append(text)
+
+    combined_text = "\n".join(headings + paragraphs)
+    return {
+        "url": url,
+        "title": title,
+        "headings": headings,
+        "paragraphs": paragraphs,
+        "combined_text": combined_text,
+        "content_hash": compute_content_hash(combined_text),
+    }
+
+
+def is_probably_useful_page(page: Dict[str, Any]) -> bool:
+    text = page.get("combined_text", "").lower()
+    title = page.get("title", "").lower()
+    url = page.get("url", "").lower()
+    if any(pattern in title or pattern in url or pattern in text[:500] for pattern in LOW_VALUE_PATTERNS):
+        return False
+    return len(text) >= 200
+
+
+def chunk_text(text: str, chunk_size: int = CHUNK_SIZE_CHARS, overlap: int = CHUNK_OVERLAP_CHARS) -> List[str]:
+    text = clean_text(text)
+    if not text:
+        return []
+    chunks = []
+    start = 0
+    text_length = len(text)
+    while start < text_length and len(chunks) < MAX_CHUNKS_PER_PAGE:
+        end = min(start + chunk_size, text_length)
+        chunk = text[start:end]
+        if end < text_length:
+            last_period = chunk.rfind(". ")
+            last_newline = chunk.rfind("\n")
+            boundary = max(last_period, last_newline)
+            if boundary > int(chunk_size * 0.6):
+                chunk = chunk[: boundary + 1]
+                end = start + len(chunk)
+        chunks.append(chunk.strip())
+        if end >= text_length:
+            break
+        start = max(end - overlap, 0)
+    return chunks
+
+
+def call_deepseek_json(client: OpenAI, prompt: str, max_tokens: int = 1300) -> Dict[str, Any]:
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = client.chat.completions.create(
+                model=DEEPSEEK_MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a B2B technology strategy analyst for Cognizant. "
+                            "Return valid json only. No markdown. No code fences."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                response_format={"type": "json_object"},
+                max_tokens=max_tokens,
+                stream=False,
+            )
+            return safe_json_loads(response.choices[0].message.content or "")
+        except Exception as exc:
+            if attempt == MAX_RETRIES:
+                return {
+                    "relevance": "Unknown",
+                    "opportunity_score": 0,
+                    "industry": "Unknown",
+                    "signals": [],
+                    "services": [],
+                    "risk_flags": [f"API error: {str(exc)[:120]}"],
+                    "public_sector_hint": "Unknown",
+                    "agency_hints": [],
+                    "chunk_assessment": "DeepSeek request failed.",
+                    "content_summary": "",
+                    "public_sector_relevant": "Unknown",
+                    "relevant_agencies": [],
+                    "agency_pursuit_rationale": "",
+                }
+            time.sleep(RETRY_BASE_DELAY * attempt)
+    return {
+        "relevance": "Unknown",
+        "opportunity_score": 0,
+        "industry": "Unknown",
+        "signals": [],
+        "services": [],
+        "risk_flags": ["Unexpected API failure"],
+        "public_sector_hint": "Unknown",
+        "agency_hints": [],
+        "chunk_assessment": "DeepSeek request failed.",
+        "content_summary": "",
+        "public_sector_relevant": "Unknown",
+        "relevant_agencies": [],
+        "agency_pursuit_rationale": "",
+    }
+
+
+def analyze_chunk_with_deepseek(client: OpenAI, page_title: str, page_url: str, chunk_text_value: str, chunk_index: int, total_chunks: int) -> Dict[str, Any]:
+    prompt = f"""
+Assess the following web content chunk for relevance to IT outsourcing and business opportunity for Cognizant.
+
+Context:
+- Page title: {page_title}
+- Page URL: {page_url}
+- Chunk number: {chunk_index} of {total_chunks}
+
+Instructions:
+1. Determine whether the content indicates a business opportunity related to IT outsourcing, managed services, consulting, systems integration, cloud modernization, data/AI, cybersecurity, application modernization, platform engineering, business process transformation, or public sector digital transformation.
+2. Focus on explicit and implicit signals, not just keywords.
+3. Ignore generic marketing fluff unless it indicates a real transformation need, spending trigger, policy change, operational pressure, modernization initiative, new digital program, regulatory burden, cost pressure, service gap, capability gap, or outsourcing need.
+4. Identify whether the chunk appears relevant to government or public sector agencies.
+5. Be concrete and commercially useful.
+6. Return json only.
+
+Return JSON with exactly these keys:
+{{
+  "relevance": "High|Medium|Low|None",
+  "opportunity_score": 0,
+  "industry": "string",
+  "signals": ["string", "..."],
+  "services": ["string", "..."],
+  "risk_flags": ["string", "..."],
+  "public_sector_hint": "Yes|No|Maybe",
+  "agency_hints": ["string", "..."],
+  "chunk_assessment": "max 90 words"
+}}
+
+Content chunk:
+"""
+{chunk_text_value}
+"""
+""".strip()
+    return call_deepseek_json(client, prompt, max_tokens=700)
+
+
+def synthesize_page_assessment(client: OpenAI, page_title: str, page_url: str, chunk_results: List[Dict[str, Any]], full_text_preview: str) -> Dict[str, Any]:
+    chunk_json = json.dumps(chunk_results, ensure_ascii=False, indent=2)
+    prompt = f"""
+You are preparing a concise go-to-market note for Cognizant.
+
+Using the chunk-level analysis below, produce a final page-level assessment.
+
+Return json with exactly these keys:
+{{
+  "overall_relevance": "High|Medium|Low|None",
+  "overall_opportunity_score": 0,
+  "industry": "string",
+  "content_summary": "summary of the page content in no more than 150 words",
+  "recommended_services": ["string", "..."],
+  "public_sector_relevant": "Yes|No|Maybe",
+  "relevant_agencies": ["string", "..."],
+  "agency_pursuit_rationale": "brief explanation of why the listed public sector agencies are relevant targets",
+  "implications": "brief note under 200 words covering the opportunity and implications for IT outsourcing",
+  "pursuit_recommendation": "Strong pursue|Selective pursue|Monitor|No immediate action"
+}}
+
+Page title: {page_title}
+Page URL: {page_url}
+
+Chunk analyses:
+{chunk_json}
+
+Short text preview:
+"""
+{full_text_preview[:3000]}
+"""
+
+Rules:
+- content_summary must be no more than 150 words.
+- The summary should describe what the page is about, not sales advice.
+- public_sector_relevant should be:
+  - Yes: clearly relevant to one or more public sector agencies
+  - Maybe: potentially relevant to public sector but not explicit
+  - No: not meaningfully relevant to public sector pursuit
+- relevant_agencies should list the public sector agencies or government bodies that would be logical targets for this opportunity.
+- Only include agencies if there is a credible connection based on the page content.
+- If there are no clear agencies, return an empty list.
+- agency_pursuit_rationale should briefly explain why those agencies are relevant.
+- If no agencies are relevant, return an empty string.
+- Keep the implications field under 200 words.
+- Be specific about why this matters for IT outsourcing.
+- Mention likely demand triggers such as modernization, cloud, legacy renewal, compliance, cost pressure, AI adoption, operating model change, citizen/customer experience, cybersecurity, or managed services.
+- Do not overstate certainty.
+- If opportunity is weak, say so clearly.
+- Return json only.
+""".strip()
+    return call_deepseek_json(client, prompt, max_tokens=1300)
+
+
+def analyze_page_with_deepseek(client: OpenAI, page: Dict[str, Any]) -> Dict[str, Any]:
+    chunks = chunk_text(page["combined_text"])
+    if not chunks:
+        return {
+            "url": page["url"],
+            "title": page["title"],
+            "industry": "Unknown",
+            "overall_relevance": "None",
+            "opportunity_score": 0,
+            "content_summary": "",
+            "signals": [],
+            "recommended_services": [],
+            "risk_flags": [],
+            "public_sector_relevant": "No",
+            "relevant_agencies": [],
+            "agency_pursuit_rationale": "",
+            "pursuit_recommendation": "No immediate action",
+            "implications": "No meaningful textual content found on the page.",
+            "content_hash": page.get("content_hash", ""),
+            "analysis_timestamp": utc_now_string(),
+            "chunk_count": 0,
+        }
+
+    chunk_results = []
+    for idx, chunk in enumerate(chunks, start=1):
+        chunk_results.append(
+            analyze_chunk_with_deepseek(
+                client=client,
+                page_title=page["title"],
+                page_url=page["url"],
+                chunk_text_value=chunk,
+                chunk_index=idx,
+                total_chunks=len(chunks),
+            )
+        )
+        time.sleep(0.4)
+
+    final_assessment = synthesize_page_assessment(
+        client=client,
+        page_title=page["title"],
+        page_url=page["url"],
+        chunk_results=chunk_results,
+        full_text_preview=page["combined_text"][:8000],
+    )
+
+    all_signals, all_services, all_risks, all_agencies = [], [], [], []
+    for chunk in chunk_results:
+        all_signals.extend(chunk.get("signals", []))
+        all_services.extend(chunk.get("services", []))
+        all_risks.extend(chunk.get("risk_flags", []))
+        all_agencies.extend(chunk.get("agency_hints", []))
+
+    all_services.extend(final_assessment.get("recommended_services", []))
+    all_agencies.extend(final_assessment.get("relevant_agencies", []))
+
+    return {
+        "url": page["url"],
+        "title": page["title"],
+        "industry": final_assessment.get("industry", "Unknown"),
+        "overall_relevance": final_assessment.get("overall_relevance", "Unknown"),
+        "opportunity_score": final_assessment.get("overall_opportunity_score", 0),
+        "content_summary": final_assessment.get("content_summary", ""),
+        "signals": dedupe_preserve_order([str(x) for x in all_signals]),
+        "recommended_services": dedupe_preserve_order([str(x) for x in all_services]),
+        "risk_flags": dedupe_preserve_order([str(x) for x in all_risks]),
+        "public_sector_relevant": final_assessment.get("public_sector_relevant", "Unknown"),
+        "relevant_agencies": dedupe_preserve_order([str(x) for x in all_agencies]),
+        "agency_pursuit_rationale": final_assessment.get("agency_pursuit_rationale", ""),
+        "pursuit_recommendation": final_assessment.get("pursuit_recommendation", "Monitor"),
+        "implications": final_assessment.get("implications", ""),
+        "content_hash": page.get("content_hash", ""),
+        "analysis_timestamp": utc_now_string(),
+        "chunk_count": len(chunks),
+    }
+
+
+def get_cached_result(content_hash: str) -> Optional[Dict[str, Any]]:
+    conn = get_db_connection()
+    row = conn.execute(
+        "SELECT result_json FROM analyzed_pages WHERE content_hash = ?", (content_hash,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    try:
+        return json.loads(row["result_json"])
+    except json.JSONDecodeError:
+        return None
+
+
+def save_analysis_result(result: Dict[str, Any], destination_url: str) -> None:
+    conn = get_db_connection()
+    conn.execute(
+        """
+        INSERT INTO analyzed_pages (
+            content_hash, url, title, content_summary, result_json, analyzed_at, destination_url
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(content_hash) DO UPDATE SET
+            url=excluded.url,
+            title=excluded.title,
+            content_summary=excluded.content_summary,
+            result_json=excluded.result_json,
+            analyzed_at=excluded.analyzed_at,
+            destination_url=excluded.destination_url
+        """,
+        (
+            result.get("content_hash", ""),
+            result.get("url", ""),
+            result.get("title", ""),
+            result.get("content_summary", ""),
+            json.dumps(result, ensure_ascii=False),
+            result.get("analysis_timestamp", utc_now_string()),
+            destination_url,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def log_delivery(content_hash: str, destination_url: str, status_code: Optional[int], success: bool, response_excerpt: str) -> None:
+    conn = get_db_connection()
+    conn.execute(
+        """
+        INSERT INTO delivery_log (content_hash, destination_url, status_code, success, response_excerpt, sent_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            content_hash,
+            destination_url,
+            status_code,
+            1 if success else 0,
+            response_excerpt[:500],
+            utc_now_string(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def build_payload(run_meta: Dict[str, Any], analyzed_pages: List[Dict[str, Any]], skipped_pages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "run": run_meta,
+        "summary": {
+            "analyzed_count": len(analyzed_pages),
+            "skipped_cached_count": len(skipped_pages),
+        },
+        "analyzed_pages": analyzed_pages,
+        "skipped_cached_pages": skipped_pages,
+    }
+
+
+def sign_payload(payload: str, secret: str) -> str:
+    return hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def deliver_payload(destination_url: str, payload: Dict[str, Any], bearer_token: str = "", webhook_secret: str = "") -> Dict[str, Any]:
+    body = json.dumps(payload, ensure_ascii=False)
+    headers = {"Content-Type": "application/json"}
+    if bearer_token:
+        headers["Authorization"] = f"Bearer {bearer_token}"
+    if webhook_secret:
+        headers["X-Signature-SHA256"] = sign_payload(body, webhook_secret)
+
+    try:
+        response = requests.post(destination_url, data=body.encode("utf-8"), headers=headers, timeout=REQUEST_TIMEOUT)
+        success = 200 <= response.status_code < 300
+        return {
+            "success": success,
+            "status_code": response.status_code,
+            "response_excerpt": response.text[:500],
+        }
+    except requests.RequestException as exc:
+        return {
+            "success": False,
+            "status_code": None,
+            "response_excerpt": str(exc)[:500],
+        }
+
+
+def summarize_results(results: List[Dict[str, Any]]) -> Dict[str, int]:
+    counts = {"High": 0, "Medium": 0, "Low": 0, "None": 0, "Unknown": 0}
+    for result in results:
+        relevance = result.get("overall_relevance", "Unknown")
+        counts[relevance] = counts.get(relevance, 0) + 1
+    return counts
+
+
+@app.get("/")
+def index():
+    return render_template(
+        "index.html",
+        default_destination_url=DEFAULT_DESTINATION_URL,
+        max_pages_default=MAX_PAGES_DEFAULT,
+    )
+
+
+@app.post("/analyze")
+def analyze():
+    start_url = request.form.get("start_url", "").strip()
+    destination_url = request.form.get("destination_url", DEFAULT_DESTINATION_URL).strip()
+    outbound_bearer_token = request.form.get("outbound_bearer_token", DEFAULT_OUTBOUND_BEARER_TOKEN).strip()
+    webhook_secret = request.form.get("webhook_secret", "").strip()
+    restrict_to_path = request.form.get("restrict_to_path") == "on"
+    max_pages_raw = request.form.get("max_pages", str(MAX_PAGES_DEFAULT)).strip()
+
+    if not start_url:
+        return render_template("result.html", error="Start URL is required."), 400
+    if not destination_url:
+        return render_template("result.html", error="Destination URL is required."), 400
+
+    try:
+        max_pages = int(max_pages_raw) if max_pages_raw else MAX_PAGES_DEFAULT
+        max_pages = max(1, min(max_pages, 200))
+    except ValueError:
+        return render_template("result.html", error="Max pages must be a valid integer."), 400
+
+    try:
+        client = get_deepseek_client()
+    except Exception as exc:
+        return render_template("result.html", error=str(exc)), 500
+
+    crawled_urls = crawl_site(start_url, max_pages=max_pages, restrict_to_path=restrict_to_path)
+
+    analyzed_results: List[Dict[str, Any]] = []
+    skipped_cached_pages: List[Dict[str, Any]] = []
+    skipped_low_value: List[str] = []
+    skipped_unreadable: List[str] = []
+
+    for url in crawled_urls:
+        page = scrape_page(url)
+        if not page:
+            skipped_unreadable.append(url)
+            continue
+        if not is_probably_useful_page(page):
+            skipped_low_value.append(url)
+            continue
+
+        cached = get_cached_result(page["content_hash"])
+        if cached:
+            skipped_cached_pages.append({
+                "url": page["url"],
+                "title": page["title"],
+                "content_hash": page["content_hash"],
+                "content_summary": cached.get("content_summary", ""),
+                "analysis_timestamp": cached.get("analysis_timestamp", ""),
+            })
+            continue
+
+        result = analyze_page_with_deepseek(client, page)
+        analyzed_results.append(result)
+        save_analysis_result(result, destination_url)
+
+    run_meta = {
+        "started_at": utc_now_string(),
+        "source_url": start_url,
+        "destination_url": destination_url,
+        "restrict_to_path": restrict_to_path,
+        "max_pages": max_pages,
+        "crawled_count": len(crawled_urls),
+        "skipped_low_value_count": len(skipped_low_value),
+        "skipped_unreadable_count": len(skipped_unreadable),
+        "relevance_breakdown": summarize_results(analyzed_results),
+    }
+
+    payload = build_payload(run_meta, analyzed_results, skipped_cached_pages)
+    delivery = deliver_payload(destination_url, payload, outbound_bearer_token, webhook_secret)
+
+    for result in analyzed_results:
+        log_delivery(
+            content_hash=result.get("content_hash", ""),
+            destination_url=destination_url,
+            status_code=delivery.get("status_code"),
+            success=delivery.get("success", False),
+            response_excerpt=delivery.get("response_excerpt", ""),
+        )
+
+    return render_template(
+        "result.html",
+        result={
+            "run": run_meta,
+            "delivery": delivery,
+            "analyzed_results": analyzed_results,
+            "skipped_cached_pages": skipped_cached_pages,
+            "skipped_low_value": skipped_low_value,
+            "skipped_unreadable": skipped_unreadable,
+        },
+        payload_preview=json.dumps(payload, ensure_ascii=False, indent=2),
+    )
+
+
+@app.get("/api/history")
+def api_history():
+    conn = get_db_connection()
+    rows = conn.execute(
+        "SELECT content_hash, url, title, content_summary, analyzed_at, destination_url FROM analyzed_pages ORDER BY analyzed_at DESC LIMIT 100"
+    ).fetchall()
+    conn.close()
+    return jsonify([
+        {
+            "content_hash": row["content_hash"],
+            "url": row["url"],
+            "title": row["title"],
+            "content_summary": row["content_summary"],
+            "analyzed_at": row["analyzed_at"],
+            "destination_url": row["destination_url"],
+        }
+        for row in rows
+    ])
+
+
+@app.get("/health")
+def health():
+    return jsonify({"status": "ok", "time": utc_now_string()})
+
+
+if __name__ == "__main__":
+    init_db()
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port, debug=False)

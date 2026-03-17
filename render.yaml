@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Run Result</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+  <main class="container">
+    <a href="/" class="back-link">← Back</a>
+
+    {% if error %}
+      <section class="card error-card">
+        <h1>Request failed</h1>
+        <p>{{ error }}</p>
+      </section>
+    {% else %}
+      <section class="card">
+        <h1>Run completed</h1>
+        <div class="stats-grid">
+          <div class="stat"><span>Crawled</span><strong>{{ result.run.crawled_count }}</strong></div>
+          <div class="stat"><span>Analyzed</span><strong>{{ result.analyzed_results|length }}</strong></div>
+          <div class="stat"><span>Skipped (cached)</span><strong>{{ result.skipped_cached_pages|length }}</strong></div>
+          <div class="stat"><span>Destination status</span><strong>{{ result.delivery.status_code or 'n/a' }}</strong></div>
+        </div>
+        <p><strong>Destination:</strong> {{ result.run.destination_url }}</p>
+        <p><strong>Delivery success:</strong> {{ 'Yes' if result.delivery.success else 'No' }}</p>
+        <p><strong>Response:</strong> {{ result.delivery.response_excerpt }}</p>
+      </section>
+
+      <section class="card">
+        <h2>Analyzed pages</h2>
+        {% if result.analyzed_results %}
+          {% for page in result.analyzed_results %}
+            <article class="result-card">
+              <h3>{{ page.title }}</h3>
+              <p class="url">{{ page.url }}</p>
+              <div class="pill-row">
+                <span class="pill">Relevance: {{ page.overall_relevance }}</span>
+                <span class="pill">Score: {{ page.opportunity_score }}</span>
+                <span class="pill">Public sector: {{ page.public_sector_relevant }}</span>
+              </div>
+              <p><strong>Summary:</strong> {{ page.content_summary }}</p>
+              <p><strong>Relevant agencies:</strong> {{ page.relevant_agencies|join(', ') if page.relevant_agencies else '—' }}</p>
+              <p><strong>Agency rationale:</strong> {{ page.agency_pursuit_rationale or '—' }}</p>
+              <p><strong>Recommended services:</strong> {{ page.recommended_services|join(', ') if page.recommended_services else '—' }}</p>
+              <p><strong>Implications:</strong> {{ page.implications }}</p>
+            </article>
+          {% endfor %}
+        {% else %}
+          <p>No fresh pages needed analysis.</p>
+        {% endif %}
+      </section>
+
+      <section class="card">
+        <h2>Skipped because already analyzed</h2>
+        {% if result.skipped_cached_pages %}
+          <ul class="compact-list">
+            {% for page in result.skipped_cached_pages %}
+              <li>
+                <strong>{{ page.title }}</strong><br>
+                <span class="url">{{ page.url }}</span><br>
+                <small>Last analyzed: {{ page.analysis_timestamp or 'unknown' }}</small>
+              </li>
+            {% endfor %}
+          </ul>
+        {% else %}
+          <p>None.</p>
+        {% endif %}
+      </section>
+
+      <section class="card">
+        <h2>Payload preview</h2>
+        <pre>{{ payload_preview }}</pre>
+      </section>
+    {% endif %}
+  </main>
+</body>
+</html>

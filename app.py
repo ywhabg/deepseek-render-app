@@ -4,4 +4,4 @@ app = Flask(__name__)
 
 @app.get("/")
 def root():
-    return {"message": "DeepSeek server is running"}
+    return render_template("index.htm")

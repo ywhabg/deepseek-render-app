@@ -1,6 +1,6 @@
-from fastapi import FastAPI
+from flask import Flask, request, render_template, jsonify
 
-app = FastAPI()
+app = Flask(__name__)
 
 @app.get("/")
 def root():

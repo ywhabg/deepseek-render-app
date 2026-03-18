@@ -3,6 +3,7 @@ import re
 import json
 import time
 import hashlib
+import secrets
 from datetime import datetime
 from collections import deque
 from typing import List, Dict, Any, Optional, Set
@@ -13,9 +14,19 @@ import pandas as pd
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from openai import OpenAI
-from flask import Flask, render_template, request, jsonify, session, flash, redirect, url_for
+from flask import (
+    Flask,
+    render_template,
+    request,
+    jsonify,
+    session,
+    flash,
+    redirect,
+    url_for,
+    Response,
+    stream_with_context,
+)
 from flask_session import Session
-import secrets
 
 # =========================
 # Configuration
@@ -24,10 +35,10 @@ import secrets
 load_dotenv()
 
 app = Flask(__name__)
-app.secret_key = os.getenv('FLASK_SECRET_KEY', secrets.token_hex(32))
-app.config['SESSION_TYPE'] = 'filesystem'
-app.config['SESSION_PERMANENT'] = False
-app.config['SESSION_USE_SIGNER'] = True
+app.secret_key = os.getenv("FLASK_SECRET_KEY", secrets.token_hex(32))
+app.config["SESSION_TYPE"] = "filesystem"
+app.config["SESSION_PERMANENT"] = False
+app.config["SESSION_USE_SIGNER"] = True
 Session(app)
 
 HEADERS = {
@@ -50,7 +61,6 @@ RETRY_BASE_DELAY = 2.0
 CHUNK_SIZE_CHARS = 6000
 CHUNK_OVERLAP_CHARS = 500
 MAX_CHUNKS_PER_PAGE = 8
-FINAL_SUMMARY_WORD_LIMIT = 150
 
 TRACKING_PARAMS = {
     "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
@@ -87,8 +97,8 @@ LOW_VALUE_PATTERNS = [
 # HTTP session
 # =========================
 
-SESSION = requests.Session()
-SESSION.headers.update(HEADERS)
+HTTP_SESSION = requests.Session()
+HTTP_SESSION.headers.update(HEADERS)
 
 # =========================
 # Utility functions
@@ -98,7 +108,7 @@ def get_deepseek_client() -> OpenAI:
     api_key = os.getenv("DEEPSEEK_API_KEY")
     if not api_key:
         raise ValueError(
-            "DEEPSEEK_API_KEY not found. Put it in your .env file or environment variables."
+            "DEEPSEEK_API_KEY not found. Add it to your Render environment variables."
         )
 
     return OpenAI(
@@ -133,11 +143,7 @@ def is_same_domain(base_url: str, target_url: str) -> bool:
 def should_skip_url(url: str) -> bool:
     lower_url = url.lower()
 
-    if lower_url.startswith("mailto:"):
-        return True
-    if lower_url.startswith("javascript:"):
-        return True
-    if lower_url.startswith("tel:"):
+    if lower_url.startswith(("mailto:", "javascript:", "tel:")):
         return True
 
     for ext in SKIP_EXTENSIONS:
@@ -178,16 +184,16 @@ def dedupe_preserve_order(values: List[str]) -> List[str]:
     seen = set()
     result = []
     for v in values:
-        v = str(v).strip()
-        if v and v not in seen:
-            seen.add(v)
-            result.append(v)
+        value = str(v).strip()
+        if value and value not in seen:
+            seen.add(value)
+            result.append(value)
     return result
 
 def get_with_retries(url: str, timeout: int = REQUEST_TIMEOUT) -> Optional[requests.Response]:
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            response = SESSION.get(url, timeout=timeout)
+            response = HTTP_SESSION.get(url, timeout=timeout)
             response.raise_for_status()
             return response
         except requests.RequestException as exc:
@@ -235,7 +241,6 @@ def crawl_site(
     start_url: str,
     max_pages: int = MAX_PAGES_DEFAULT,
     restrict_to_path: bool = False,
-    progress_callback=None
 ) -> List[str]:
     start_url = normalize_url(start_url)
     visited: Set[str] = set()
@@ -252,16 +257,10 @@ def crawl_site(
         if current_url in visited:
             continue
 
-        if progress_callback:
-            progress_callback(f"Crawling: {current_url}", len(results), max_pages)
-
         visited.add(current_url)
 
         response = get_with_retries(current_url)
-        if not response:
-            continue
-
-        if not is_html_response(response):
+        if not response or not is_html_response(response):
             continue
 
         soup = BeautifulSoup(response.text, "html.parser")
@@ -277,9 +276,8 @@ def crawl_site(
             if parsed.netloc != base_domain:
                 continue
 
-            if restrict_to_path and start_path:
-                if not parsed.path.startswith(start_path):
-                    continue
+            if restrict_to_path and start_path and not parsed.path.startswith(start_path):
+                continue
 
             discovered.add(link)
             queue.append(link)
@@ -294,10 +292,7 @@ def crawl_site(
 
 def scrape_page(url: str) -> Optional[Dict[str, Any]]:
     response = get_with_retries(url)
-    if not response:
-        return None
-
-    if not is_html_response(response):
+    if not response or not is_html_response(response):
         return None
 
     soup = BeautifulSoup(response.text, "html.parser")
@@ -553,7 +548,7 @@ Rules:
 
     return call_deepseek_json(client, prompt, max_tokens=1300)
 
-def analyze_page_with_deepseek(client: OpenAI, page: Dict[str, Any], progress_callback=None) -> Dict[str, Any]:
+def analyze_page_with_deepseek(client: OpenAI, page: Dict[str, Any]) -> Dict[str, Any]:
     combined_text = page["combined_text"]
     chunks = chunk_text(combined_text)
 
@@ -580,9 +575,6 @@ def analyze_page_with_deepseek(client: OpenAI, page: Dict[str, Any], progress_ca
 
     chunk_results = []
     for idx, chunk in enumerate(chunks, start=1):
-        if progress_callback:
-            progress_callback(f"Analyzing chunk {idx}/{len(chunks)} for: {page['title'][:50]}...")
-        
         result = analyze_chunk_with_deepseek(
             client=client,
             page_title=page["title"],
@@ -642,208 +634,193 @@ def analyze_page_with_deepseek(client: OpenAI, page: Dict[str, Any], progress_ca
     }
 
 # =========================
-# Flask Routes
+# Flask routes
 # =========================
 
-@app.route('/')
+@app.route("/")
 def index():
-    """Render the main input form."""
-    return render_template('index.html')
+    return render_template("index.html")
 
-@app.route('/analyze', methods=['POST'])
+@app.route("/analyze", methods=["POST"])
 def analyze():
-    """Handle the analysis request."""
-    url = request.form.get('url', '').strip()
-    max_pages = int(request.form.get('max_pages', MAX_PAGES_DEFAULT))
-    restrict_to_path = request.form.get('restrict_to_path') == 'on'
-    
+    url = request.form.get("url", "").strip()
+
+    try:
+        max_pages = int(request.form.get("max_pages", MAX_PAGES_DEFAULT))
+    except (TypeError, ValueError):
+        max_pages = MAX_PAGES_DEFAULT
+
+    restrict_to_path = request.form.get("restrict_to_path") == "on"
+
     if not url:
-        flash('Please enter a URL to analyze', 'error')
-        return redirect(url_for('index'))
-    
-    # Store parameters in session for the progress page
-    session['analysis_params'] = {
-        'url': url,
-        'max_pages': max_pages,
-        'restrict_to_path': restrict_to_path
+        flash("Please enter a URL to analyze", "error")
+        return redirect(url_for("index"))
+
+    session["analysis_params"] = {
+        "url": url,
+        "max_pages": max_pages,
+        "restrict_to_path": restrict_to_path,
     }
-    session['analysis_results'] = None
-    session['analysis_status'] = 'starting'
-    session['analysis_logs'] = []
-    
-    return redirect(url_for('progress'))
+    session["analysis_results"] = None
+    session["analysis_status"] = "starting"
+    session.modified = True
 
-@app.route('/progress')
+    return redirect(url_for("progress"))
+
+@app.route("/progress")
 def progress():
-    """Show progress page with live updates."""
-    if 'analysis_params' not in session:
-        return redirect(url_for('index'))
-    
-    return render_template('progress.html')
+    if "analysis_params" not in session:
+        return redirect(url_for("index"))
 
-@app.route('/api/run-analysis')
+    return render_template("progress.html")
+
+@app.route("/api/run-analysis")
 def run_analysis():
-    """API endpoint to run the analysis and stream progress."""
-    from flask import Response, stream_with_context
-    
-    params = session.get('analysis_params', {})
+    params = session.get("analysis_params", {})
     if not params:
-        return jsonify({'error': 'No analysis parameters found'}), 400
-    
+        return jsonify({"error": "No analysis parameters found"}), 400
+
     def generate():
-        def log_message(msg, progress=None):
-            nonlocal log_lines
-            log_lines.append(msg)
-            session['analysis_logs'] = log_lines[-50:]  # Keep last 50 lines
-            session.modified = True
-            
-            data = {'log': msg}
-            if progress is not None:
-                data['progress'] = progress
-            yield f"data: {json.dumps(data)}\n\n"
-        
-        log_lines = []
-        
         try:
-            # Initialize DeepSeek client
-            log_message("Initializing DeepSeek client...")
+            def sse(data: Dict[str, Any]) -> str:
+                return f"data: {json.dumps(data)}\n\n"
+
+            yield sse({"log": "Initializing DeepSeek client..."})
             client = get_deepseek_client()
-            
-            # Crawl the site
-            log_message(f"Starting crawl of {params['url']}...")
+
+            yield sse({"log": f"Starting crawl of {params['url']}..."})
             urls = crawl_site(
-                start_url=params['url'],
-                max_pages=params['max_pages'],
-                restrict_to_path=params['restrict_to_path'],
-                progress_callback=lambda msg, current, total: log_message(msg, int((current/total)*30))
+                start_url=params["url"],
+                max_pages=params["max_pages"],
+                restrict_to_path=params["restrict_to_path"],
             )
-            
-            log_message(f"Found {len(urls)} pages to analyze", 30)
-            
-            # Scrape pages
+
+            yield sse({"log": f"Found {len(urls)} pages to analyze", "progress": 30})
+
             scraped_pages = []
+            total_urls = max(len(urls), 1)
+
             for i, url in enumerate(urls):
-                log_message(f"Scraping: {url}", 30 + int((i/len(urls))*20))
-                
+                progress = 30 + int((i / total_urls) * 20)
+                yield sse({"log": f"Scraping: {url}", "progress": progress})
+
                 page_data = scrape_page(url)
                 if page_data and is_probably_useful_page(page_data):
                     scraped_pages.append(page_data)
-            
-            log_message(f"Found {len(scraped_pages)} useful pages to analyze", 50)
-            
+
+            yield sse({
+                "log": f"Found {len(scraped_pages)} useful pages to analyze",
+                "progress": 50
+            })
+
             if not scraped_pages:
-                log_message("No useful pages found to analyze", 100)
-                session['analysis_results'] = []
-                session['analysis_status'] = 'completed'
-                yield f"data: {json.dumps({'complete': True, 'redirect': '/results'})}\n\n"
+                session["analysis_results"] = []
+                session["analysis_status"] = "completed"
+                session.modified = True
+                yield sse({"complete": True, "redirect": "/results"})
                 return
-            
-            # Analyze pages
+
             results = []
+            total_pages = max(len(scraped_pages), 1)
+
             for i, page in enumerate(scraped_pages):
-                log_message(f"Analyzing page {i+1}/{len(scraped_pages)}: {page['title'][:50]}...", 
-                           50 + int((i/len(scraped_pages))*45))
-                
-                result = analyze_page_with_deepseek(
-                    client, 
-                    page,
-                    lambda msg: log_message(f"  {msg}")
-                )
+                progress = 50 + int((i / total_pages) * 45)
+                yield sse({
+                    "log": f"Analyzing page {i + 1}/{len(scraped_pages)}: {page['title'][:50]}...",
+                    "progress": progress
+                })
+
+                result = analyze_page_with_deepseek(client, page)
                 results.append(result)
-            
-            log_message("Analysis complete!", 95)
-            
-            # Convert to DataFrame for sorting/filtering
+
             df = pd.DataFrame(results)
-            
-            # Sort by opportunity score
+
             relevance_rank = {"High": 4, "Medium": 3, "Low": 2, "None": 1, "Unknown": 0}
             df["Relevance Rank"] = df["Overall Relevance"].map(relevance_rank).fillna(0)
             df = df.sort_values(
                 by=["Opportunity Score", "Relevance Rank", "Title"],
                 ascending=[False, False, True],
             ).drop(columns=["Relevance Rank"])
-            
-            # Store results in session
-            session['analysis_results'] = df.to_dict('records')
-            session['analysis_status'] = 'completed'
+
+            session["analysis_results"] = df.to_dict("records")
+            session["analysis_status"] = "completed"
             session.modified = True
-            
-            log_message("Redirecting to results...", 100)
-            yield f"data: {json.dumps({'complete': True, 'redirect': '/results'})}\n\n"
-            
+
+            yield sse({"log": "Analysis complete", "progress": 100})
+            yield sse({"complete": True, "redirect": "/results"})
+
         except Exception as e:
-            log_message(f"ERROR: {str(e)}")
-            session['analysis_status'] = 'error'
+            session["analysis_status"] = "error"
+            session.modified = True
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
-    
+
     return Response(
         stream_with_context(generate()),
-        mimetype='text/event-stream',
+        mimetype="text/event-stream",
         headers={
-            'Cache-Control': 'no-cache',
-            'X-Accel-Buffering': 'no'
-        }
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
     )
 
-@app.route('/results')
+@app.route("/results")
 def results():
-    """Display the analysis results."""
-    results_data = session.get('analysis_results', [])
-    
-    if not results_data:
-        flash('No results available. Please run an analysis first.', 'warning')
-        return redirect(url_for('index'))
-    
-    # Calculate summary statistics
-    df = pd.DataFrame(results_data)
-    
-    summary = {
-        'total_pages': len(df),
-        'high_opportunity': len(df[df['Opportunity Score'] >= 70]),
-        'medium_opportunity': len(df[(df['Opportunity Score'] >= 40) & (df['Opportunity Score'] < 70)]),
-        'low_opportunity': len(df[df['Opportunity Score'] < 40]),
-        'public_sector_count': len(df[df['Public Sector Relevant'] == 'Yes']),
-        'avg_score': round(df['Opportunity Score'].mean(), 1) if not df.empty else 0,
-        'industries': df['Industry'].value_counts().head(5).to_dict(),
-        'top_pages': df.nlargest(5, 'Opportunity Score')[['Title', 'Opportunity Score', 'Overall Relevance', 'Public Sector Relevant']].to_dict('records')
-    }
-    
-    return render_template('results.html', 
-                         results=results_data, 
-                         summary=summary,
-                         results_json=json.dumps(results_data))
+    results_data = session.get("analysis_results", [])
 
-@app.route('/api/results')
+    if not results_data:
+        flash("No results available. Please run an analysis first.", "warning")
+        return redirect(url_for("index"))
+
+    df = pd.DataFrame(results_data)
+
+    summary = {
+        "total_pages": len(df),
+        "high_opportunity": len(df[df["Opportunity Score"] >= 70]),
+        "medium_opportunity": len(df[(df["Opportunity Score"] >= 40) & (df["Opportunity Score"] < 70)]),
+        "low_opportunity": len(df[df["Opportunity Score"] < 40]),
+        "public_sector_count": len(df[df["Public Sector Relevant"] == "Yes"]),
+        "avg_score": round(df["Opportunity Score"].mean(), 1) if not df.empty else 0,
+        "industries": df["Industry"].value_counts().head(5).to_dict(),
+        "top_pages": df.nlargest(5, "Opportunity Score")[
+            ["Title", "Opportunity Score", "Overall Relevance", "Public Sector Relevant"]
+        ].to_dict("records"),
+    }
+
+    return render_template(
+        "results.html",
+        results=results_data,
+        summary=summary,
+        results_json=json.dumps(results_data),
+    )
+
+@app.route("/api/results")
 def api_results():
-    """API endpoint to get results as JSON."""
-    results_data = session.get('analysis_results', [])
+    results_data = session.get("analysis_results", [])
     return jsonify(results_data)
 
-@app.route('/export')
+@app.route("/export")
 def export_results():
-    """Export results as JSON or CSV."""
-    format_type = request.args.get('format', 'json')
-    results_data = session.get('analysis_results', [])
-    
-    if format_type == 'json':
+    format_type = request.args.get("format", "json")
+    results_data = session.get("analysis_results", [])
+
+    if format_type == "json":
         return jsonify(results_data)
-    elif format_type == 'csv':
+
+    if format_type == "csv":
         df = pd.DataFrame(results_data)
         return Response(
             df.to_csv(index=False),
-            mimetype='text/csv',
-            headers={'Content-Disposition': 'attachment;filename=analysis_results.csv'}
+            mimetype="text/csv",
+            headers={"Content-Disposition": "attachment; filename=analysis_results.csv"},
         )
-    
-    return jsonify({'error': 'Invalid format'}), 400
 
-@app.route('/clear')
+    return jsonify({"error": "Invalid format"}), 400
+
+@app.route("/clear")
 def clear_session():
-    """Clear the session and start over."""
     session.clear()
-    flash('Session cleared. Start a new analysis.', 'info')
-    return redirect(url_for('index'))
+    flash("Session cleared. Start a new analysis.", "info")
+    return redirect(url_for("index"))
 
-if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
+if __name__ == "__main__":
+    app.run(debug=True, host="0.0.0.0", port=int(os.getenv("PORT", 5000)))

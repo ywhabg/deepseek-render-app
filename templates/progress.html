@@ -77,7 +77,7 @@
     <div class="header">
         <div class="container">
             <h2><i class="bi bi-arrow-repeat me-2"></i> Analysis in Progress</h2>
-            <p class="lead mb-0">Please wait while we analyse the website...</p>
+            <p class="lead mb-0">Please wait while the website is being analysed...</p>
         </div>
     </div>
 
@@ -124,7 +124,7 @@
 
                     <h5 class="mb-2">Live Log</h5>
                     <div class="log-container" id="logContainer">
-                        <div class="log-entry log-info">Initializing analysis...</div>
+                        <div class="log-entry log-info">Initialising analysis...</div>
                     </div>
 
                     <div class="d-flex justify-content-between mt-3">
@@ -182,9 +182,9 @@
             } else if (data.progress < 50) {
                 statusEl.textContent = 'Scraping pages...';
             } else if (data.progress < 95) {
-                statusEl.textContent = 'Analyzing with AI...';
+                statusEl.textContent = 'Analysing with AI...';
             } else {
-                statusEl.textContent = 'Finalizing...';
+                statusEl.textContent = 'Finalising...';
             }
         }
 

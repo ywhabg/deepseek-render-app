@@ -764,7 +764,7 @@ def run_analysis():
                 for i, page in enumerate(scraped_pages, start=1):
                     progress = 50 + int((i / total_pages) * 45)
                     yield sse({
-                        "log": f"Analyzing page {i}/{len(scraped_pages)}: {page['title'][:60]}...",
+                        "log": f"Analysing page {i}/{len(scraped_pages)}: {page['title'][:60]}...",
                         "progress": progress
                     })
 

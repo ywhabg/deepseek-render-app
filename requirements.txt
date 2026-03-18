@@ -9,3 +9,4 @@ requests==2.32.5
 beautifulsoup4
 python-dotenv
 openai
+Flask-Session

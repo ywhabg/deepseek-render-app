@@ -5,3 +5,4 @@ setuptools<82
 wheel
 openpyxl==3.1.5
 numpy==2.2.6
+requests==2.32.5

@@ -852,16 +852,44 @@ def results():
         source_url=source_url,
     )
 
-
-@app.route("/api/results")
-def api_results():
+   
+@app.route("/results")
+def results():
     run_id = session.get("current_run_id")
     if not run_id:
-        return jsonify([])
+        flash("No results available. Please run an analysis first.", "warning")
+        return redirect(url_for("index"))
 
-    return jsonify(load_run_results(run_id))
-    
+    results_data = load_run_results(run_id)
+    if not results_data:
+        flash("No results available. Please run an analysis first.", "warning")
+        return redirect(url_for("index"))
 
+    df = pd.DataFrame(results_data)
+
+    summary = {
+        "total_pages": len(df),
+        "high_opportunity": len(df[df["Opportunity Score"] >= 70]),
+        "medium_opportunity": len(df[(df["Opportunity Score"] >= 40) & (df["Opportunity Score"] < 70)]),
+        "low_opportunity": len(df[df["Opportunity Score"] < 40]),
+        "public_sector_count": len(df[df["Public Sector Relevant"] == "Yes"]),
+        "avg_score": round(df["Opportunity Score"].mean(), 1) if not df.empty else 0,
+        "industries": df["Industry"].value_counts().head(5).to_dict(),
+        "top_pages": df.nlargest(5, "Opportunity Score")[
+            ["Title", "Opportunity Score", "Overall Relevance", "Public Sector Relevant"]
+        ].to_dict("records"),
+    }
+
+    params = session.get("analysis_params", {})
+    source_url = params.get("url", "the submitted site")
+
+    return render_template(
+        "results.html",
+        results=results_data,
+        summary=summary,
+        results_json=json.dumps(results_data),
+        source_url=source_url,
+    )
 @app.route("/export")
 def export_results():
     format_type = request.args.get("format", "json")

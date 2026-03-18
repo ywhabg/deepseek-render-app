@@ -679,7 +679,7 @@ def analyze():
     restrict_to_path = request.form.get("restrict_to_path") == "on"
 
     if not url:
-        flash("Please enter a URL to analyze.", "error")
+        flash("Please enter a URL to analyse.", "error")
         return redirect(url_for("index"))
 
     run_id = uuid.uuid4().hex
@@ -752,7 +752,7 @@ def run_analysis():
                         scraped_pages.append(page_data)
 
             yield sse({
-                "log": f"Found {len(scraped_pages)} useful pages to analyze.",
+                "log": f"Found {len(scraped_pages)} useful pages to analyse.",
                 "progress": 50
             })
 

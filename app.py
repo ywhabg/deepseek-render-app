@@ -4,6 +4,8 @@ import json
 import time
 import hashlib
 import secrets
+import uuid
+from pathlib import Path
 from datetime import datetime
 from collections import deque
 from typing import List, Dict, Any, Optional, Set
@@ -93,6 +95,9 @@ LOW_VALUE_PATTERNS = [
     "log in",
 ]
 
+RESULTS_DIR = Path("analysis_runs")
+RESULTS_DIR.mkdir(exist_ok=True)
+
 # =========================
 # HTTP session
 # =========================
@@ -103,6 +108,24 @@ HTTP_SESSION.headers.update(HEADERS)
 # =========================
 # Utility functions
 # =========================
+
+def save_run_results(run_id: str, records: List[Dict[str, Any]]) -> None:
+    output_file = RESULTS_DIR / f"{run_id}.json"
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
+
+def load_run_results(run_id: str) -> List[Dict[str, Any]]:
+    output_file = RESULTS_DIR / f"{run_id}.json"
+    if not output_file.exists():
+        return []
+
+    with open(output_file, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def delete_run_results(run_id: str) -> None:
+    output_file = RESULTS_DIR / f"{run_id}.json"
+    if output_file.exists():
+        output_file.unlink()
 
 def get_deepseek_client() -> OpenAI:
     api_key = os.getenv("DEEPSEEK_API_KEY")
@@ -645,6 +668,9 @@ def index():
 def analyze():
     url = request.form.get("url", "").strip()
 
+    if url and not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
     try:
         max_pages = int(request.form.get("max_pages", MAX_PAGES_DEFAULT))
     except (TypeError, ValueError):
@@ -653,16 +679,19 @@ def analyze():
     restrict_to_path = request.form.get("restrict_to_path") == "on"
 
     if not url:
-        flash("Please enter a URL to analyze", "error")
+        flash("Please enter a URL to analyze.", "error")
         return redirect(url_for("index"))
+
+    run_id = uuid.uuid4().hex
 
     session["analysis_params"] = {
         "url": url,
         "max_pages": max_pages,
         "restrict_to_path": restrict_to_path,
+        "run_id": run_id,
     }
-    session["analysis_results"] = None
     session["analysis_status"] = "starting"
+    session["current_run_id"] = run_id
     session.modified = True
 
     return redirect(url_for("progress"))
@@ -680,79 +709,105 @@ def run_analysis():
     if not params:
         return jsonify({"error": "No analysis parameters found"}), 400
 
-    def generate():
-        try:
-            def sse(data: Dict[str, Any]) -> str:
-                return f"data: {json.dumps(data)}\n\n"
+    run_id = params.get("run_id")
+    if not run_id:
+        return jsonify({"error": "No run ID found"}), 400
 
-            yield sse({"log": "Initializing DeepSeek client..."})
+    def generate():
+        def sse(data: Dict[str, Any]) -> str:
+            return f"data: {json.dumps(data)}\n\n"
+
+        try:
+            session["analysis_status"] = "running"
+            session.modified = True
+
+            yield sse({"log": "Initializing DeepSeek client...", "progress": 5})
             client = get_deepseek_client()
 
-            yield sse({"log": f"Starting crawl of {params['url']}..."})
+            yield sse({"log": f"Starting crawl of {params['url']}...", "progress": 10})
             urls = crawl_site(
                 start_url=params["url"],
                 max_pages=params["max_pages"],
                 restrict_to_path=params["restrict_to_path"],
             )
 
-            yield sse({"log": f"Found {len(urls)} pages to analyze", "progress": 30})
+            yield sse({"log": f"Found {len(urls)} pages during crawl.", "progress": 30})
 
             scraped_pages = []
             total_urls = max(len(urls), 1)
 
-            for i, url in enumerate(urls):
+            for i, url in enumerate(urls, start=1):
                 progress = 30 + int((i / total_urls) * 20)
                 yield sse({"log": f"Scraping: {url}", "progress": progress})
 
                 page_data = scrape_page(url)
-                if page_data and is_probably_useful_page(page_data):
-                    scraped_pages.append(page_data)
+                if page_data:
+                    page_len = len(page_data.get("combined_text", ""))
+                    useful = is_probably_useful_page(page_data)
+                    yield sse({
+                        "log": f"Scraped page length={page_len} | useful={useful} | {url}"
+                    })
+
+                    if useful:
+                        scraped_pages.append(page_data)
 
             yield sse({
-                "log": f"Found {len(scraped_pages)} useful pages to analyze",
+                "log": f"Found {len(scraped_pages)} useful pages to analyze.",
                 "progress": 50
             })
 
-            if not scraped_pages:
-                session["analysis_results"] = []
-                session["analysis_status"] = "completed"
-                session.modified = True
-                yield sse({"complete": True, "redirect": "/results"})
-                return
-
             results = []
-            total_pages = max(len(scraped_pages), 1)
 
-            for i, page in enumerate(scraped_pages):
-                progress = 50 + int((i / total_pages) * 45)
-                yield sse({
-                    "log": f"Analyzing page {i + 1}/{len(scraped_pages)}: {page['title'][:50]}...",
-                    "progress": progress
-                })
+            if scraped_pages:
+                total_pages = max(len(scraped_pages), 1)
 
-                result = analyze_page_with_deepseek(client, page)
-                results.append(result)
+                for i, page in enumerate(scraped_pages, start=1):
+                    progress = 50 + int((i / total_pages) * 45)
+                    yield sse({
+                        "log": f"Analyzing page {i}/{len(scraped_pages)}: {page['title'][:60]}...",
+                        "progress": progress
+                    })
 
-            df = pd.DataFrame(results)
+                    result = analyze_page_with_deepseek(client, page)
+                    results.append(result)
 
-            relevance_rank = {"High": 4, "Medium": 3, "Low": 2, "None": 1, "Unknown": 0}
-            df["Relevance Rank"] = df["Overall Relevance"].map(relevance_rank).fillna(0)
-            df = df.sort_values(
-                by=["Opportunity Score", "Relevance Rank", "Title"],
-                ascending=[False, False, True],
-            ).drop(columns=["Relevance Rank"])
+            yield sse({"log": f"Final results count: {len(results)}"})
 
-            session["analysis_results"] = df.to_dict("records")
+            if results:
+                df = pd.DataFrame(results)
+
+                relevance_rank = {"High": 4, "Medium": 3, "Low": 2, "None": 1, "Unknown": 0}
+                df["Relevance Rank"] = df["Overall Relevance"].map(relevance_rank).fillna(0)
+
+                df = df.sort_values(
+                    by=["Opportunity Score", "Relevance Rank", "Title"],
+                    ascending=[False, False, True],
+                ).drop(columns=["Relevance Rank"])
+
+                final_records = df.to_dict("records")
+            else:
+                final_records = []
+
+            save_run_results(run_id, final_records)
+
             session["analysis_status"] = "completed"
+            session["current_run_id"] = run_id
             session.modified = True
 
-            yield sse({"log": "Analysis complete", "progress": 100})
-            yield sse({"complete": True, "redirect": "/results"})
+            if not final_records:
+                yield sse({
+                    "log": "Analysis completed, but no useful pages produced results.",
+                    "progress": 100
+                })
+            else:
+                yield sse({"log": "Analysis complete.", "progress": 100})
+
+            yield sse({"complete": True, "redirect": url_for("results")})
 
         except Exception as e:
             session["analysis_status"] = "error"
             session.modified = True
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            yield sse({"error": str(e)})
 
     return Response(
         stream_with_context(generate()),
@@ -765,11 +820,42 @@ def run_analysis():
 
 @app.route("/results")
 def results():
-    results_data = session.get("analysis_results", [])
+    run_id = session.get("current_run_id")
+    analysis_status = session.get("analysis_status")
 
-    if not results_data:
+    if not run_id:
         flash("No results available. Please run an analysis first.", "warning")
         return redirect(url_for("index"))
+
+    if analysis_status in {"starting", "running"}:
+        flash("Analysis is still running.", "info")
+        return redirect(url_for("progress"))
+
+    if analysis_status == "error":
+        flash("The analysis encountered an error. Please try again.", "error")
+        return redirect(url_for("index"))
+
+    results_data = load_run_results(run_id)
+
+    if results_data == []:
+        summary = {
+            "total_pages": 0,
+            "high_opportunity": 0,
+            "medium_opportunity": 0,
+            "low_opportunity": 0,
+            "public_sector_count": 0,
+            "avg_score": 0,
+            "industries": {},
+            "top_pages": [],
+        }
+
+        flash("Analysis completed, but no useful pages were found.", "info")
+        return render_template(
+            "results.html",
+            results=[],
+            summary=summary,
+            results_json="[]",
+        )
 
     df = pd.DataFrame(results_data)
 
@@ -795,13 +881,22 @@ def results():
 
 @app.route("/api/results")
 def api_results():
-    results_data = session.get("analysis_results", [])
-    return jsonify(results_data)
+    run_id = session.get("current_run_id")
+    if not run_id:
+        return jsonify([])
+
+    return jsonify(load_run_results(run_id))
+    
 
 @app.route("/export")
 def export_results():
     format_type = request.args.get("format", "json")
-    results_data = session.get("analysis_results", [])
+    run_id = session.get("current_run_id")
+
+    if not run_id:
+        return jsonify({"error": "No analysis results found"}), 400
+
+    results_data = load_run_results(run_id)
 
     if format_type == "json":
         return jsonify(results_data)
@@ -818,9 +913,14 @@ def export_results():
 
 @app.route("/clear")
 def clear_session():
+    run_id = session.get("current_run_id")
+    if run_id:
+        delete_run_results(run_id)
+
     session.clear()
     flash("Session cleared. Start a new analysis.", "info")
     return redirect(url_for("index"))
+    
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=int(os.getenv("PORT", 5000)))

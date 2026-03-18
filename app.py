@@ -820,42 +820,11 @@ def run_analysis():
 
 @app.route("/results")
 def results():
-    run_id = session.get("current_run_id")
-    analysis_status = session.get("analysis_status")
+    results_data = session.get("analysis_results", [])
 
-    if not run_id:
+    if not results_data:
         flash("No results available. Please run an analysis first.", "warning")
         return redirect(url_for("index"))
-
-    if analysis_status in {"starting", "running"}:
-        flash("Analysis is still running.", "info")
-        return redirect(url_for("progress"))
-
-    if analysis_status == "error":
-        flash("The analysis encountered an error. Please try again.", "error")
-        return redirect(url_for("index"))
-
-    results_data = load_run_results(run_id)
-
-    if results_data == []:
-        summary = {
-            "total_pages": 0,
-            "high_opportunity": 0,
-            "medium_opportunity": 0,
-            "low_opportunity": 0,
-            "public_sector_count": 0,
-            "avg_score": 0,
-            "industries": {},
-            "top_pages": [],
-        }
-
-        flash("Analysis completed, but no useful pages were found.", "info")
-        return render_template(
-            "results.html",
-            results=[],
-            summary=summary,
-            results_json="[]",
-        )
 
     df = pd.DataFrame(results_data)
 
@@ -872,12 +841,17 @@ def results():
         ].to_dict("records"),
     }
 
+    params = session.get("analysis_params", {})
+    source_url = params.get("url", "the submitted site")
+
     return render_template(
         "results.html",
         results=results_data,
         summary=summary,
         results_json=json.dumps(results_data),
+        source_url=source_url,
     )
+
 
 @app.route("/api/results")
 def api_results():

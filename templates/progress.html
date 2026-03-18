@@ -139,87 +139,98 @@
         </div>
     </div>
 
-    <script>
-        const eventSource = new EventSource('/api/run-analysis');
-        const logContainer = document.getElementById('logContainer');
-        const progressBar = document.getElementById('progressBar');
-        const statusEl = document.getElementById('status');
-        const viewResultsBtn = document.getElementById('viewResultsBtn');
+   <script>
+    const eventSource = new EventSource('/api/run-analysis');
+    const logContainer = document.getElementById('logContainer');
+    const progressBar = document.getElementById('progressBar');
+    const statusEl = document.getElementById('status');
+    const viewResultsBtn = document.getElementById('viewResultsBtn');
 
-        eventSource.onmessage = function(event) {
-            const data = JSON.parse(event.data);
-            
-            if (data.log) {
-                // Add log entry
-                const logEntry = document.createElement('div');
-                logEntry.className = 'log-entry';
-                
-                if (data.log.includes('ERROR')) {
-                    logEntry.classList.add('log-error');
-                } else if (data.log.includes('complete')) {
-                    logEntry.classList.add('log-success');
-                } else {
-                    logEntry.classList.add('log-info');
-                }
-                
-                const timestamp = new Date().toLocaleTimeString();
-                logEntry.textContent = `[${timestamp}] ${data.log}`;
-                logContainer.appendChild(logEntry);
-                logContainer.scrollTop = logContainer.scrollHeight;
-            }
-            
-            if (data.progress !== undefined) {
-                progressBar.style.width = data.progress + '%';
-                progressBar.textContent = data.progress + '%';
-                
-                if (data.progress < 30) {
-                    statusEl.textContent = 'Crawling...';
-                } else if (data.progress < 50) {
-                    statusEl.textContent = 'Scraping pages...';
-                } else if (data.progress < 95) {
-                    statusEl.textContent = 'Analyzing with AI...';
-                } else {
-                    statusEl.textContent = 'Finalizing...';
-                }
-            }
-            
-            if (data.complete) {
-                statusEl.textContent = 'Complete!';
-                progressBar.classList.remove('progress-bar-animated');
-                viewResultsBtn.style.display = 'inline-block';
-                
-                if (data.redirect) {
-                    setTimeout(() => {
-                        window.location.href = data.redirect;
-                    }, 1000);
-                }
-            }
-            
-            if (data.error) {
-                statusEl.textContent = 'Error';
-                statusEl.classList.remove('bg-primary');
-                statusEl.classList.add('bg-danger');
-                
-                const errorEntry = document.createElement('div');
-                errorEntry.className = 'log-entry log-error';
-                errorEntry.textContent = `[ERROR] ${data.error}`;
-                logContainer.appendChild(errorEntry);
-                
-                eventSource.close();
-            }
-        };
+    let analysisCompleted = false;
 
-        eventSource.onerror = function() {
-            statusEl.textContent = 'Connection lost';
-            statusEl.classList.remove('bg-primary');
-            statusEl.classList.add('bg-warning');
+    function appendLog(message, type = 'info') {
+        const logEntry = document.createElement('div');
+        logEntry.className = `log-entry log-${type}`;
+        const timestamp = new Date().toLocaleTimeString();
+        logEntry.textContent = `[${timestamp}] ${message}`;
+        logContainer.appendChild(logEntry);
+        logContainer.scrollTop = logContainer.scrollHeight;
+    }
+
+    eventSource.onmessage = function(event) {
+        const data = JSON.parse(event.data);
+
+        if (data.log) {
+            const logText = data.log.toLowerCase();
+
+            if (logText.includes('error')) {
+                appendLog(data.log, 'error');
+            } else if (logText.includes('complete') || logText.includes('finished')) {
+                appendLog(data.log, 'success');
+            } else {
+                appendLog(data.log, 'info');
+            }
+        }
+
+        if (data.progress !== undefined) {
+            progressBar.style.width = data.progress + '%';
+            progressBar.textContent = data.progress + '%';
+
+            if (data.progress < 30) {
+                statusEl.textContent = 'Crawling...';
+            } else if (data.progress < 50) {
+                statusEl.textContent = 'Scraping pages...';
+            } else if (data.progress < 95) {
+                statusEl.textContent = 'Analyzing with AI...';
+            } else {
+                statusEl.textContent = 'Finalizing...';
+            }
+        }
+
+        if (data.complete) {
+            analysisCompleted = true;
+            statusEl.textContent = 'Complete!';
+            statusEl.classList.remove('bg-primary', 'bg-danger', 'bg-warning');
+            statusEl.classList.add('bg-success');
+            progressBar.style.width = '100%';
+            progressBar.textContent = '100%';
+            progressBar.classList.remove('progress-bar-animated');
+            viewResultsBtn.style.display = 'inline-block';
+
+            appendLog('Analysis completed successfully.', 'success');
             eventSource.close();
-        };
 
-        // Clean up on page unload
-        window.addEventListener('beforeunload', function() {
+            if (data.redirect) {
+                setTimeout(() => {
+                    window.location.href = data.redirect;
+                }, 1000);
+            }
+        }
+
+        if (data.error) {
+            statusEl.textContent = 'Error';
+            statusEl.classList.remove('bg-primary', 'bg-warning', 'bg-success');
+            statusEl.classList.add('bg-danger');
+
+            appendLog(`ERROR: ${data.error}`, 'error');
             eventSource.close();
-        });
-    </script>
+        }
+    };
+
+    eventSource.onerror = function() {
+        if (analysisCompleted) return;
+
+        statusEl.textContent = 'Connection lost';
+        statusEl.classList.remove('bg-primary', 'bg-success');
+        statusEl.classList.add('bg-warning');
+
+        appendLog('Connection to analysis stream was lost.', 'error');
+        eventSource.close();
+    };
+
+    window.addEventListener('beforeunload', function() {
+        eventSource.close();
+    });
+</script>
 </body>
 </html>
